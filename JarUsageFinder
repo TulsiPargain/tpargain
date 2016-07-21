@@ -1,0 +1,194 @@
+package com.jar.scan;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+import java.util.zip.ZipInputStream;
+
+import org.apache.commons.io.IOUtils;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.commons.InstructionAdapter;
+
+import com.sun.xml.internal.ws.org.objectweb.asm.Type;
+
+public class JarUsageFinder extends ClassVisitor {
+	private String callerClass;
+	private String callerMethod;
+	private static String filterPrefix;
+	private Map<String, Map<String, Set<String>>> calls = new HashMap<String, Map<String, Set<String>>>();
+	private static String jarName = "";
+
+	public JarUsageFinder(int api, String filterPrefix, Map<String, Map<String, Set<String>>> calls) {
+		super(api);
+		JarUsageFinder.filterPrefix = filterPrefix;
+		this.calls = calls;
+	}
+
+	@Override
+	public void visit(int version, int access, String name, String signature, String superName, String[] interfaces) {
+		this.callerClass = name.replace('/', '.').replace('$', '.');
+		super.visit(version, access, name, signature, superName, interfaces);
+	}
+
+	private static boolean outputCall(String fullCall) {
+		if (fullCall.startsWith(filterPrefix)) {
+			return true;
+		}
+		return false;
+	}
+
+	@Override
+	public MethodVisitor visitMethod(int access, String name, String desc, String signature, String[] exceptions) {
+		callerMethod = callerClass + "." + name;
+		MethodVisitor oriMv = new MethodVisitor(Opcodes.ASM4) {
+		};
+		InstructionAdapter instMv = new InstructionAdapter(oriMv) {
+			@Override
+			public void visitMethodInsn(int opcode, String owner, String name, String desc) {
+				String calledClass = owner.replace('/', '.').replace('$', '.');
+				String calledMethod = name;
+				StringBuilder calledSignature = new StringBuilder();
+				calledSignature.append('(');
+				boolean first = true;
+				for (Type type : Type.getArgumentTypes(desc)) {
+					if (first) {
+						first = false;
+					} else {
+						calledSignature.append(", ");
+					}
+					calledSignature.append(type.getClassName().replace("java.lang.", ""));
+				}
+				calledSignature.append(") returns ");
+				calledSignature.append(Type.getReturnType(desc).getClassName().replace("java.lang.", ""));
+				String fullCall = calledClass + '.' + calledMethod + calledSignature;
+				if (outputCall(fullCall)) {
+					Map<String, Set<String>> jarmap = calls.get(jarName);
+					if (jarmap == null) {
+						jarmap = new HashMap<>();
+						calls.put(jarName, jarmap);
+					}
+					if (!jarmap.containsKey(fullCall)) {
+						jarmap.put(fullCall, null);
+
+					}
+					;
+					Set<String> callers = jarmap.get(fullCall);
+					if (callers == null) {
+						callers = new HashSet<String>();
+						jarmap.put(fullCall, callers);
+					}
+					callers.add(JarUsageFinder.this.callerMethod);
+
+				}
+				super.visitMethodInsn(opcode, owner, name, desc);
+			}
+		};
+		return instMv;
+	}
+
+	private static void visit(File directory, String filterPrefix, Map<String, Map<String, Set<String>>> calls)
+			throws Exception {
+
+		File[] files = directory.listFiles();
+		if(files == null) 
+		{
+			System.out.println("No jar file found, exiting");
+			return;
+		}
+		for (File file : files) {
+			if (file.isDirectory()) {
+				visit(file, filterPrefix, calls);
+			} else if (file.getName().endsWith(".class")) {
+				try {
+					ClassReader classReader = new ClassReader(new FileInputStream(file));
+					classReader.accept(new JarUsageFinder(Opcodes.ASM4, filterPrefix, calls), 0);
+				} catch (Exception e) {
+					System.out.println("Problem processing '" + file.getAbsolutePath() + "': " + e.getMessage());
+				}
+			} else if (file.getName().endsWith(".jar")) {
+				ZipInputStream zip;
+				ZipFile zipFile;
+				try {
+					zipFile = new ZipFile(file);
+					zip = new ZipInputStream(new FileInputStream(file));
+					jarName = file.getName();
+					for (ZipEntry entry = zip.getNextEntry(); entry != null; entry = zip.getNextEntry()) {
+						if (!entry.isDirectory() && entry.getName().endsWith(".class")) {
+							File zipFileEntry = File.createTempFile("temp", "tmp");
+							zipFileEntry.deleteOnExit();
+							try (FileOutputStream out = new FileOutputStream(zipFileEntry)) {
+								IOUtils.copy(zipFile.getInputStream(entry), out);
+							}
+							ClassReader classReader = new ClassReader(new FileInputStream(zipFileEntry));
+							classReader.accept(new JarUsageFinder(Opcodes.ASM4, filterPrefix, calls), 0);
+						}
+					}
+				} catch (FileNotFoundException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				} catch (IOException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			}
+		}
+	}
+
+	private static void visit(String[] rootDirs, String filterPrefix, Map<String, Map<String, Set<String>>> calls)
+			throws Exception {
+		for (String rootDir : rootDirs) {
+			visit(new File(rootDir), filterPrefix, calls);
+		}
+	}
+
+	private static void output(Map<String, Map<String, Set<String>>> calls) {
+		List<String> keys = new ArrayList<String>(calls.keySet());
+		Collections.sort(keys);
+		for (String key : keys) {
+			System.out.println("=====================================================================");
+			System.out.println("Module name: " + key);
+			Map<String, Set<String>> map = calls.get(key);
+			for (String entry : map.keySet()) {
+				System.out.println("Called Method: " + entry);
+				List<String> callers = new ArrayList<String>(map.get(entry));
+				if ((callers == null) || callers.isEmpty()) {
+					continue;
+				}
+				Collections.sort(callers);
+				System.out.println("Calling Method: ");
+				for (String caller : callers) {
+					System.out.println("    " + caller);
+				}
+			}
+
+		}
+
+	}
+
+	// Sample command line args:
+	// "/Users/test/git/jars/,/Users/test/git/jars" "com.test.jar.used"
+	public static void main(String[] args) throws Exception {
+		String rootDirs = args[0];
+		String filterPrefix = args.length > 1 ? args[1] : null;
+		boolean outputCallers = args.length > 2 ? Boolean.parseBoolean(args[2]) : true;
+		System.out.println(JarUsageFinder.class.getSimpleName() + ": rootDirs=" + args[0] + ", filterPrefix="
+				+ filterPrefix + ", outputCallers=" + outputCallers);
+		Map<String, Map<String, Set<String>>> calls = new HashMap<String, Map<String, Set<String>>>();
+		visit(rootDirs.split(","), filterPrefix, calls);
+		output(calls);
+	}
+}
